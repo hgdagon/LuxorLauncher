@@ -1,4 +1,7 @@
+.idea
+.venv
 .xmake
 build
 staging
 vsxmake2022
+/*.exe

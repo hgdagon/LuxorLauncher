@@ -11,25 +11,28 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <vector>
+
+#define XXH_INLINE_ALL
+#include "xxhash.h"
 
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "User32.lib")
 
-char* GetGameFile(const wchar_t* path, size_t& size)
+std::vector<char> GetGameFile(const wchar_t* path)
 {
   HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
   if (f == INVALID_HANDLE_VALUE)
-    return 0;
+    return {};
 
 
   LARGE_INTEGER li{};
   GetFileSizeEx(f, &li);
 
-  size = li.QuadPart;
-  char* data = new char[li.QuadPart] {};
+  std::vector<char> data(li.QuadPart);
 
   DWORD bytesRead{};
-  ReadFile(f, data, li.QuadPart, &bytesRead, NULL);
+  ReadFile(f, data.data(), (DWORD)data.size(), &bytesRead, NULL);
 
   CloseHandle(f);
 
@@ -71,32 +74,20 @@ inline char __ROL1__(char value, int count) { return __ROL__((char)value, count)
 #define BYTEn(x, n)   (*((char*)&(x)+n))
 #define BYTE2(x)   BYTEn(x,  2)
 
-#define GAME_LUXOR 0
-#define GAME_LUXOR2 1
-#define GAME_LUXORAR 2
-int get_game()
+uint32_t hash_data(const std::vector<char>& data)
 {
-  WCHAR exename[2048]{};
-  GetModuleFileNameW(NULL, exename, sizeof(exename) / sizeof(WCHAR));
-
-  if (wcsstr(exename, L"Luxor.exe") != NULL) return GAME_LUXOR;
-  if (wcsstr(exename, L"Luxor2.exe") != NULL) return GAME_LUXOR2;
-  if (wcsstr(exename, L"Luxor AR.exe") != NULL) return GAME_LUXORAR;
-
-  return GAME_LUXOR;
+    return XXH32(data.data(), data.size(), 0);
 }
 
-void decrypt_game()
+void decrypt_game(std::vector<char> gamefile, const wchar_t* key)
 {
-  size_t gamesize = 0;
+  char* data = gamefile.data();
 
-  char* gamefile = GetGameFile(L"game.dmg", gamesize);
+  int pe_offset = read_int(data, 0x3C);
 
-  int pe_offset = read_int(gamefile, 0x3C);
+  IMAGE_NT_HEADERS32* pe_header = (IMAGE_NT_HEADERS32*)(data + pe_offset);
 
-  IMAGE_NT_HEADERS32* pe_header = (IMAGE_NT_HEADERS32*)(gamefile + pe_offset);
-
-  IMAGE_SECTION_HEADER* segment_start = (IMAGE_SECTION_HEADER*)(gamefile + pe_offset + 248);
+  IMAGE_SECTION_HEADER* segment_start = (IMAGE_SECTION_HEADER*)(data + pe_offset + 248);
 
 
   IMAGE_SECTION_HEADER text_segment{};
@@ -110,36 +101,18 @@ void decrypt_game()
     }
   }
 
-
-  // Luxor: {0DDCE464-5839-4ABD-BF32-DA838B9DB604}
-  // Luxor 2: {6EAB4510-C0E6-4009-9D04-FA45EAF31D02}
-  // Luxor AR: {B107D9DA-82FD-46F1-A000-5175CD244980}
-  const wchar_t* key = L"";
-
-  switch (get_game()) {
-  case GAME_LUXOR:
-    key = L"{0DDCE464-5839-4ABD-BF32-DA838B9DB604}";
-    break;
-  case GAME_LUXOR2:
-    key = L"{6EAB4510-C0E6-4009-9D04-FA45EAF31D02}";
-    break;
-  case GAME_LUXORAR:
-    key = L"{B107D9DA-82FD-46F1-A000-5175CD244980}";
-  }
-
   IID iid{};
   IIDFromString(key, &iid); // from resources of Luxor.exe
 
-
   unsigned int lcg_state = iid.Data1;
 
-  char* text_start = gamefile + text_segment.PointerToRawData;
+  char* text_start = gamefile.data() + text_segment.PointerToRawData;
 
   size_t entrypoint_offset = pe_header->OptionalHeader.AddressOfEntryPoint - text_segment.VirtualAddress;
 
   entrypoint_offset -= 0x10;
 
-  for (int i = 0; i < text_segment.Misc.VirtualSize; i++) {
+  for (size_t i = 0; i < text_segment.Misc.VirtualSize; i++) {
     if (i >= entrypoint_offset && i <= entrypoint_offset + 0x20) {
       continue;
     }
@@ -153,12 +126,11 @@ void decrypt_game()
   HANDLE outf = CreateFileW(L"game_dec.dmg", GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 
   DWORD byteswritten{};
-  WriteFile(outf, gamefile, gamesize, &byteswritten, NULL);
+  WriteFile(outf, gamefile.data(), gamefile.size(), &byteswritten, NULL);
   CloseHandle(outf);
-
-  delete[] gamefile;
 }
 
+#ifdef RELEASE
 struct TSteamError {
   int eSteamError;
   int eDetailedErrorType;
@@ -179,9 +151,11 @@ bool OwnsAppId(unsigned int appId)
 
   return isSubscribed == 1;
 }
+#endif
 
 int main()
 {
+#ifdef RELEASE
   HMODULE steamdll = LoadLibraryA("Steam.dll");
 
   if (steamdll == NULL) {
@@ -198,50 +172,186 @@ int main()
     printf("%s\n", err.szDesc);
     return 0;
   }
+#endif
 
-  if (!(
-    OwnsAppId(15970) || OwnsAppId(15972) || // Luxor & Luxor Demo
-    OwnsAppId(15920) || OwnsAppId(15922) || // Luxor 2 & Luxor 2 Demo
-    OwnsAppId(15910) || OwnsAppId(15912) // Luxor Anum Rising & Luxor Anum Rising Demo
-    )) {
+  std::vector<char> gamefile = GetGameFile(L"game.dmg");
+
+  const wchar_t* name = L"";
+  const wchar_t* key = L"";
+  const uint32_t game_hash = hash_data(gamefile);
+  int app_ids[2] = {};
+
+  switch (game_hash) {
+    case 0x581E9069:
+      name = L"Luxor";
+      key = L"{0DDCE464-5839-4ABD-BF32-DA838B9DB604}";
+	  app_ids[0] = 15970;
+	  app_ids[1] = 15972;
+      break;
+    case 0xC7FFCD99:
+      name = L"Luxor (French)";
+      key = L"{70052C97-20C2-4124-9A57-2944D83F7E83}";
+	  app_ids[0] = 15970;
+	  app_ids[1] = 15972;
+      break;
+    case 0x1E1267D4:
+      name = L"Luxor (German)";
+      key = L"{CC7071A6-B663-49ED-94E8-7B5CB8D24B9D}";
+	  app_ids[0] = 15970;
+	  app_ids[1] = 15972;
+      break;
+    case 0x8BC5255E:
+      name = L"Luxor (Swedish)";
+      key = L"{EB308A84-66AF-42A4-A940-BDA13907DC1A}";
+	  app_ids[0] = 15970;
+	  app_ids[1] = 15972;
+      break;
+    case 0x044E7C8C:
+      name = L"Luxor Amun Rising";
+      key = L"{B107D9DA-82FD-46F1-A000-5175CD244980}";
+	  app_ids[0] = 15910;
+	  app_ids[1] = 15912;
+      break;
+    case 0x001D343A:
+      name = L"Luxor Amun Rising (French)";
+      key = L"{8A1B6391-E6D0-41B7-874E-8C6F9E153B13}";
+	  app_ids[0] = 15910;
+	  app_ids[1] = 15912;
+      break;
+    case 0xDEA924D6:
+      name = L"Luxor Amun Rising (German)";
+      key = L"{98160D16-0A32-4661-9AFB-9C2F41D3778D}";
+	  app_ids[0] = 15910;
+	  app_ids[1] = 15912;
+      break;
+    case 0x0A0EFEAB:
+      name = L"Luxor Amun Rising (Swedish)";
+      key = L"{91422428-53B3-4869-A20B-BEBDDC3FA95B}";
+	  app_ids[0] = 15910;
+	  app_ids[1] = 15912;
+      break;
+    case 0x2C96A170:
+      name = L"Luxor 2";
+      key = L"{6EAB4510-C0E6-4009-9D04-FA45EAF31D02}";
+	  app_ids[0] = 15920;
+	  app_ids[1] = 15922;
+      break;
+    case 0x21C5A0C7:
+      name = L"Luxor 2 (French)";
+      key = L"{A23460FC-5467-4B7E-A8E0-6403ADB9BA99}";
+	  app_ids[0] = 15920;
+	  app_ids[1] = 15922;
+      break;
+    case 0x9CBF6C9E:
+      name = L"Luxor 2 (German)";
+      key = L"{BFED3C63-EB97-4A5B-A9A8-7BE4E6A804B3}";
+	  app_ids[0] = 15920;
+	  app_ids[1] = 15922;
+      break;
+    case 0xADACD3ED:
+      name = L"Luxor 3";
+      key = L"{B1C36261-ED4E-4AE4-AD30-E687990F7216}";
+	  app_ids[0] = 15930;
+	  app_ids[1] = 15930;
+      break;
+    case 0x50E7AE4D:
+      name = L"Luxor 4";
+      key = L"{62FF8BE8-7F9E-446C-A57E-9E6B0ADF54E8}";
+	  app_ids[0] = 16040;
+	  app_ids[1] = 16042;
+      break;
+    case 0x144CE8BA:
+      name = L"Luxor 5";
+      key = L"{FEE36EEC-86FD-4D7D-9344-69227D70EBB2}";
+	  app_ids[0] = 60340;
+	  app_ids[1] = 60340; // NO demo for Luxor 5
+      break;
+    case 0x6393E8A9:
+      name = L"Luxor Mahjong";
+      key = L"{E5055545-CFDB-4DBC-B1D5-2BAB7158B843}";
+	  app_ids[0] = 32110;
+	  app_ids[1] = 32117;
+      break;
+    case 0x0FE73EA3:
+      name = L"Luxor Mahjong (French)";
+      key = L"{3572ABA5-1A04-4D6A-9986-C49039B4BF26}";
+	  app_ids[0] = 32110;
+	  app_ids[1] = 32117;
+      break;
+    case 0x7D950903:
+      name = L"Luxor Mahjong (German)";
+      key = L"{72628D8D-D2A7-448B-AB4A-59057E6C13AA}";
+	  app_ids[0] = 32110;
+	  app_ids[1] = 32117;
+      break;
+    case 0x9E5E428D:
+      name = L"Luxor Mahjong (Italian)";
+      key = L"{79719CB3-D982-44D9-94A0-A33726695E37}";
+	  app_ids[0] = 32110;
+	  app_ids[1] = 32117;
+      break;
+    case 0x58A3AA74:
+      name = L"Luxor Mahjong (Spanish)";
+      key = L"{7B4EF7F1-F86E-40A2-B73B-51ABFDD3C72F}";
+	  app_ids[0] = 32110;
+	  app_ids[1] = 32117;
+      break;
+    case 0x1F0A77D7:
+      name = L"Luxor Mahjong (Swedish)";
+      key = L"{01DDCCA2-11AE-4E17-ACFA-12953818F331}";
+	  app_ids[0] = 32110;
+	  app_ids[1] = 32117;
+      break;
+  }
+
+#ifdef RELEASE
+  printf("Checking ownership of %d or %d\n", app_ids[0], app_ids[1]);
+  if (!(OwnsAppId(app_ids[0]) || OwnsAppId(app_ids[1]))) {
     printf("Does not own game\n");
     SteamCleanup(&err);
     return 0;
   }
+#else
+  wprintf(L"decrypting game %ls with key %ls\n", name, key);
+#endif
 
-  decrypt_game();
+  decrypt_game(gamefile, key);
 
-  if (get_game() == GAME_LUXOR2) { // Luxor 2 has a >Win98 check that fails
-    size_t platformsize = 0;
-    char* platform = GetGameFile(L"platform.dll", platformsize);
+  if (wcscmp(name, L"Luxor 2") == 0) { // Luxor 2 has a >Win98 check that fails
+    std::vector<char> platform = GetGameFile(L"platform.dll");
 
-    // 0x2101A: 6A 05 push 5
-
+    const char search[24]  = "\x6A\x05\xE8\xBF\xF7\xFF";
+    const char replace[24] = "\x6A\x00\xE8\xBF\xF7\xFF";
 
     bool didpatch = false;
-    if (platformsize > 0x2101B && platform[0x2101A] == 0x6A && platform[0x2101B] == 5) {
-      platform[0x2101B] = 0;
-      didpatch = true;
+    for (size_t i = 0x20FF0; i < 0x21020; i++)
+    {
+        if (memcmp(&platform.data()[i], search, 6) == 0)
+        {
+            memcpy(&platform.data()[i], replace, 6);
+            didpatch = true;
+        }
     }
 
     if (didpatch) {
+      printf("Found Windows 98 check in platform.dll, patching...\n");
       MoveFileW(L"platform.dll", L"platform_unpatched.dll");
 
       HANDLE outf = CreateFileW(L"platform.dll", GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
 
       DWORD byteswritten{};
-      WriteFile(outf, platform, platformsize, &byteswritten, NULL);
+      WriteFile(outf, platform.data(), platform.size(), &byteswritten, NULL);
       CloseHandle(outf);
     }
-
-    delete[] platform;
 
   }
 
   STARTUPINFOW si{};
   PROCESS_INFORMATION pi{};
   if (!CreateProcessW(L"game_dec.dmg", NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+#ifdef RELEASE
     SteamCleanup(&err);
+#endif
     return 0;
   }
 
@@ -256,14 +366,16 @@ int main()
 
   CloseHandle(pi.hProcess);
 
+  // if (wcscmp(name, L"Luxor 2") == 0) {
+    // ReplaceFileW(L"platform.dll", L"platform_unpatched.dll", NULL, 0, NULL, NULL);
+    // DeleteFileW(L"platform_unpatched.dll");
+  // }
+
+#ifdef RELEASE
   DeleteFileW(L"game_dec.dmg");
-
-  if (get_game() == GAME_LUXOR2) {
-    ReplaceFileW(L"platform.dll", L"platform_unpatched.dll", NULL, 0, NULL, NULL);
-    DeleteFileW(L"platform_unpatched.dll");
-  }
-
   SteamCleanup(&err);
+#endif
+
   return 0;
 }
 
